@@ -228,6 +228,17 @@ class Plans(unittest.TestCase):
         self.assertEqual(rn.plan_path(cfg, "/abs/types"), Path("/abs/types"))
         self.assertEqual(rn.plan_path(cfg, "~/types"), Path.home() / "types")
 
+    def test_plan_commands_resolve_relative_to_the_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            plan = Path(d).resolve() / "review-plan.json"
+            plan.write_text(json.dumps({"repo": ".", "issues": {"repo": "o/r", "command": {"list": ["./tracker", "list"], "create": ["tracker"]}},
+                                        "reviewers": [{"command": ["~/bin/agent", "{prompt}"], "api_key_command": ["../key"]}]}))
+            cfg = rn.load_plan(str(plan))
+            self.assertEqual(cfg["issues"]["command"]["list"], [str(plan.parent / "tracker"), "list"])
+            self.assertEqual(cfg["issues"]["command"]["create"], ["tracker"])
+            self.assertEqual(cfg["reviewers"][0]["command"][0], str(Path.home() / "bin/agent"))
+            self.assertEqual(cfg["reviewers"][0]["api_key_command"], [str(plan.parent / "../key")])
+
 
 class Reviewers(unittest.TestCase):
     def test_falls_through_to_the_next_reviewer_and_fills_placeholders(self):

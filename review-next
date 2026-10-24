@@ -96,6 +96,11 @@ def load_plan(arg: str) -> Dict[str, Any]:
     cfg.setdefault("app", cfg["name"])
     cfg.setdefault("ref", "origin/main")
     cfg.setdefault("layers", {})
+    commands = [r.get("command") for r in cfg.get("reviewers") or []] + [r.get("api_key_command") for r in cfg.get("reviewers") or []]
+    commands += list(((cfg.get("issues") or {}).get("command") or {}).values())
+    for cmd in commands:
+        if cmd and cmd[0].startswith(("~", "./", "../")):
+            cmd[0] = str(plan_path(cfg, cmd[0]))
     return cfg
 
 

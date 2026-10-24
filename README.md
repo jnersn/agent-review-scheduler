@@ -113,7 +113,9 @@ scheduler shows the failure.
 ## The plan
 
 See [examples/review-plan.json](examples/review-plan.json). Paths in the plan
-can start with `~`, and relative paths are relative to the plan file.
+can start with `~`, and relative paths are relative to the plan file. The same
+applies to the program in a reviewer, key or issue command when it starts with
+`~`, `./` or `../`. Other program names are looked up on `PATH`.
 
 | Key | Default | What |
 |---|---|---|

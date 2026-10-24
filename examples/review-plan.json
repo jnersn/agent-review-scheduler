@@ -1,0 +1,33 @@
+{
+  "$comment": "Example plan. Copy to ~/.config/agent-review-scheduler/<name>/review-plan.json (with areas.txt) and edit. Paths in this file are relative to it.",
+  "app": "Example Web",
+  "repo": "~/src/example-web",
+  "ref": "origin/main",
+  "app_paths": ["src/", "tests/"],
+  "diff_excludes": ["*.lock", "*.min.js"],
+  "doc_paths": ["AGENTS.md", "CLAUDE.md", "README.md", "docs/"],
+  "areas_file": "areas.txt",
+  "issues": {
+    "repo": "example-org/example-web",
+    "labels": ["review"]
+  },
+  "model": "opus",
+  "effort": "medium",
+  "layers": {
+    "api": {"title": "API and services", "paths": ["src/api/", "src/services/"]},
+    "data": {"title": "Database and models", "paths": ["src/db/", "src/models/", "migrations/"]},
+    "ui": {"title": "Web UI", "paths": ["src/ui/", "!src/ui/vendor/"]}
+  },
+  "types": {
+    "regression":        {"scope": "diff"},
+    "area-bug-hunt":     {"scope": "area",  "cadence_days": 1},
+    "maintainability":   {"scope": "layer", "cadence_days": 7,  "churn_boost": true},
+    "unused-code":       {"scope": "app",   "cadence_days": 30, "churn_boost": true},
+    "performance":       {"scope": "layer", "cadence_days": 30, "issue_keywords": ["slow", "timeout", "memory", "n+1", "lag"]},
+    "test-suite":        {"scope": "app",   "cadence_days": 30, "issue_keywords": ["flaky", "regress", "again", "test"]},
+    "security-privacy":  {"scope": "app",   "cadence_days": 90, "release_boost": true},
+    "ui-consistency":    {"scope": "app",   "cadence_days": 30, "issue_keywords": ["keyboard", "focus", "screen reader", "accessib"]},
+    "docs-hygiene":      {"scope": "app",   "cadence_days": 30, "docs_boost": true},
+    "release-readiness": {"scope": "app",   "cadence_days": 90, "release_boost": true}
+  }
+}

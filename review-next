@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""Pick the most useful code reviews for a project right now, run them read-only with an AI agent, and deliver the reports.
+
+  review-next PLAN                  pick the top two review types and run them
+  review-next PLAN --plan           show the scores and the picks; run nothing
+  review-next PLAN --type maintainability[:services]   run named types instead of picking
+  review-next PLAN --record unused-code [--record maintainability:ui]   log reviews done some other way
+  review-next PLAN --nightly        the scheduled job: once a day, one combined issue
+  --dry                             cheap model, no issue, no ledger; prints the reports
+
+PLAN is a review-plan.json file, a directory holding one, or a name looked up as
+~/.config/agent-review-scheduler/<name>/review-plan.json. The plan sets each review type's cadence and
+scope (diff, area, layer or app), the project's layers and its areas file, how to reach the issue tracker and
+which reviewer commands to run. The review rules are Markdown files: the bundled review-types/, or the plan's
+types_dir.
+
+The choice is scored from: merged commits no regression review has covered, how overdue each type is, churn in
+the code and its docs since the type last ran, recent issues that match the type, an open release milestone due
+soon, what the last run of the type found, and a cooldown so repeated runs move on.
+
+Delivery: area and diff reviews (narrow) are printed; layer and app reviews (general) are filed as issues.
+--nightly files everything as one issue. Every review is appended to the ledger (ledger.jsonl in the state
+directory), which the next pick reads.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "0.1.0"
+HERE = Path(__file__).resolve().parent
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "agent-review-scheduler"
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "agent-review-scheduler"
+SEVERITIES = ("critical", "high", "medium", "low")
+NARROW_SCOPES = ("diff", "area")
+TITLES = {
+    "regression": "Regression review", "area-bug-hunt": "Area bug hunt", "maintainability": "Maintainability",
+    "unused-code": "Unused code", "performance": "Performance", "test-suite": "Test suite",
+    "security-privacy": "Security and privacy", "ui-consistency": "UI consistency and accessibility",
+    "docs-hygiene": "Docs and repo hygiene", "release-readiness": "Release readiness",
+}
+NEVER_RUN_SCORE = 1.5
+MAX_OVERDUE = 3.0
+ISSUE_BODY_LIMIT = 65000  # GitHub refuses bodies over 65536 characters
+COOLDOWN_HOURS = 12
+SCOPE_WINDOW_DAYS = 30
+RELEASE_WINDOW_DAYS = 21
+DIFF_LIMIT = 400_000
+REPORT_TITLE_RE = re.compile(r"(Nightly review|Review) \d{4}-\d{2}-\d{2}")  # review reports are not signals
+LIMIT_RE = re.compile(r"session limit|usage limit|hit your limit|rate limit", re.I)
+# Claude Code restricted to reading: no shell, edits, web or subagents, no MCP servers, and no settings
+# (hooks, permissions) from the reviewed repository.
+DEFAULT_REVIEWERS = [{
+    "label": "claude (read-only)",
+    "command": ["claude", "--model", "{model}", "--effort", "{effort}",
+                "--tools", "Read,Glob,Grep",
+                "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent",
+                "--setting-sources", "user", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                "-p", "{prompt}", "--output-format", "json"],
+    "output": "claude-json",
+}]
+Entry = Dict[str, Any]
+
+
+def expand(path: str) -> Path:
+    return Path(os.path.expanduser(path))
+
+
+def parse_time(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+# ---------------------------------------------------------------- config and ledger
+
+def find_plan(arg: str) -> Path:
+    for candidate in (expand(arg), expand(arg) / "review-plan.json", CONFIG_HOME / arg / "review-plan.json"):
+        if candidate.is_file():
+            return candidate.resolve()
+    raise SystemExit(f"review-next: no plan at {arg} or {CONFIG_HOME / arg / 'review-plan.json'}")
+
+
+def load_plan(arg: str) -> Dict[str, Any]:
+    path = find_plan(arg)
+    cfg = json.loads(path.read_text())
+    cfg["path"], cfg["dir"] = path, path.parent
+    cfg.setdefault("name", path.parent.name)
+    cfg.setdefault("app", cfg["name"])
+    cfg.setdefault("ref", "origin/main")
+    cfg.setdefault("layers", {})
+    return cfg
+
+
+def plan_path(cfg: Dict[str, Any], value: str) -> Path:
+    """A path from the plan: ~ expanded, relative to the plan's directory."""
+    p = expand(value)
+    return p if p.is_absolute() else cfg["dir"] / p
+
+
+def parse_areas(text: str) -> List[Tuple[str, str]]:
+    """areas.txt lines are "Title | scope and things to look for"; comments and blank lines are skipped."""
+    out = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        title, _, scope = line.partition(" | ")
+        out.append((title.strip(), scope.strip()))
+    return out
+
+
+def read_ledger(path: Path) -> List[Entry]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def append_ledger(path: Path, entries: List[Entry]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        for e in entries:
+            f.write(json.dumps(e, sort_keys=True) + "\n")
+
+
+def last_entry(ledger: List[Entry], type_name: str, scope: Optional[str] = None) -> Optional[Entry]:
+    hits = [e for e in ledger if e["type"] == type_name and (scope is None or e.get("scope") == scope)]
+    return max(hits, key=lambda e: e["at"]) if hits else None
+
+
+def hours_since(entry: Entry, now: dt.datetime) -> float:
+    return (now - parse_time(entry["at"])).total_seconds() / 3600
+
+
+# ---------------------------------------------------------------- paths and scopes
+
+def in_paths(path: str, patterns: List[str]) -> bool:
+    """Prefix patterns; a leading ! excludes."""
+    inc = [p for p in patterns if not p.startswith("!")]
+    exc = [p[1:] for p in patterns if p.startswith("!")]
+    return any(path.startswith(p) for p in inc) and not any(path.startswith(p) for p in exc)
+
+
+def area_tokens(scope_text: str) -> List[str]:
+    """Paths and type names an areas.txt scope mentions, used to match changed files to the area."""
+    tokens = []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9_+]*(?:/[A-Za-z0-9_+.]*)*", scope_text):
+        tok = tok.rstrip("/.")
+        if "/" in tok or (len(tok) >= 6 and re.search(r"[a-z][A-Z]", tok)):
+            tokens.append(tok.split("(")[0])
+    return tokens
+
+
+def files_changed_since(history: List[Tuple[int, List[Tuple[str, int]]]], since: float, match) -> Tuple[int, int]:
+    """(distinct files, changed lines) in commits after `since` (epoch seconds) whose path passes `match`."""
+    files, lines = set(), 0
+    for ts, changes in history:
+        if ts <= since:
+            continue
+        for path, n in changes:
+            if match(path):
+                files.add(path)
+                lines += n
+    return len(files), lines
+
+
+# ---------------------------------------------------------------- signals (git and issues)
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+
+
+def diff_pathspec(cfg: Dict[str, Any]) -> List[str]:
+    return [p.rstrip("/") for p in cfg["app_paths"]] + [f":(exclude){x}" for x in cfg.get("diff_excludes", [])]
+
+
+def parse_history(log: str) -> List[Tuple[int, List[Tuple[str, int]]]]:
+    """`git log --format=%x01%ct --numstat` -> [(epoch, [(path, added+deleted)])]."""
+    out = []
+    for record in log.split("\x01"):
+        lines = [l for l in record.splitlines() if l.strip()]
+        if not lines:
+            continue
+        changes = []
+        for l in lines[1:]:
+            parts = l.split("\t")
+            if len(parts) == 3:
+                added, deleted, path = parts
+                changes.append((path, (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)))
+        out.append((int(lines[0]), changes))
+    return out
+
+
+def gh_issue(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """`gh issue list --json` fields -> the issue shape the rest of the script uses."""
+    ms = raw.get("milestone") or None
+    return {"number": raw["number"], "title": raw["title"], "state": raw["state"].lower(), "created_at": raw["createdAt"],
+            "milestone": {"title": ms.get("title"), "due_on": ms.get("dueOn") or None} if ms else None}
+
+
+def fetch_issues(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every issue (open and closed) in the plan's issue repo; [] without one or when the tracker can't be read."""
+    issues_cfg = cfg.get("issues") or {}
+    repo = issues_cfg.get("repo")
+    if not repo:
+        return []
+    command = (issues_cfg.get("command") or {}).get("list")
+    if command:
+        res = subprocess.run([a.replace("{repo}", repo) for a in command], capture_output=True, text=True)
+        return json.loads(res.stdout) if res.returncode == 0 else []
+    res = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "all", "--limit", "5000",
+                          "--json", "number,title,state,createdAt,milestone"], capture_output=True, text=True)
+    return [gh_issue(i) for i in json.loads(res.stdout)] if res.returncode == 0 else []
+
+
+def release_signal(issues: List[Dict[str, Any]], now: dt.datetime) -> Optional[str]:
+    """An open issue in a release milestone that is due within RELEASE_WINDOW_DAYS."""
+    for issue in issues:
+        ms = issue.get("milestone")
+        if issue.get("state") != "open" or not ms or not ms.get("due_on"):
+            continue
+        if 0 <= (parse_time(ms["due_on"]) - now).days <= RELEASE_WINDOW_DAYS:
+            return f"release milestone {ms['title']} is due {ms['due_on'][:10]}"
+    return None
+
+
+def gather(cfg: Dict[str, Any], ledger: List[Entry], now: dt.datetime) -> Dict[str, Any]:
+    repo, ref = expand(cfg["repo"]), cfg["ref"]
+    if "/" in ref:
+        git(repo, "fetch", "-q", ref.split("/", 1)[0])
+    head = git(repo, "rev-parse", ref).strip()
+    since = (now - dt.timedelta(days=180)).strftime("%Y-%m-%d")
+    history = parse_history(git(repo, "log", ref, f"--since={since}", "--format=%x01%ct", "--numstat", "--no-renames"))
+    last_reg = last_entry(ledger, "regression")
+    base, commits = (last_reg or {}).get("head"), None
+    if base:
+        try:
+            commits = int(git(repo, "rev-list", "--count", f"{base}..{ref}", "--", *diff_pathspec(cfg)).strip())
+            base = git(repo, "rev-parse", base).strip()
+        except subprocess.CalledProcessError:
+            base, commits = None, None
+    issues = fetch_issues(cfg)
+    return {"head": head, "history": history, "regression_base": base, "regression_commits": commits,
+            "issues": issues, "release": release_signal(issues, now)}
+
+
+# ---------------------------------------------------------------- scoring
+
+def score_type(name: str, t: Dict[str, Any], cfg: Dict[str, Any], ledger: List[Entry], sig: Dict[str, Any],
+               now: dt.datetime) -> Tuple[float, List[str]]:
+    kind, reasons = t["scope"], []
+    last = last_entry(ledger, name)
+    if kind == "diff":
+        n = sig["regression_commits"]
+        if n is None:
+            return 0.0, ["no regression-reviewed commit recorded yet (start with --record regression)"]
+        if n == 0:
+            return 0.0, ["no commits since the last regression review"]
+        score = 1.0 + min(n, 40) / 20
+        reasons.append(f"{n} merged commit(s) not yet regression-reviewed")
+    else:
+        cadence = t["cadence_days"]
+        if last is None:
+            score = NEVER_RUN_SCORE
+            reasons.append("never run")
+        else:
+            days = hours_since(last, now) / 24
+            score = min(days / cadence, MAX_OVERDUE)
+            reasons.append(f"last run {days:.1f} days ago (cadence {cadence} days)")
+        since = parse_time(last["at"]).timestamp() if last else (now - dt.timedelta(days=SCOPE_WINDOW_DAYS)).timestamp()
+        if t.get("churn_boost"):
+            _, lines = files_changed_since(sig["history"], since, lambda p: in_paths(p, cfg["app_paths"]))
+            if lines >= 250:
+                score += min(lines / 5000, 1.0)
+                reasons.append(f"{lines} lines changed since")
+        if t.get("docs_boost"):
+            docs, _ = files_changed_since(sig["history"], since, lambda p: in_paths(p, cfg.get("doc_paths", [])))
+            if docs:
+                score += min(docs / 5, 1.0)
+                reasons.append(f"{docs} doc file(s) changed since")
+        keywords = t.get("issue_keywords")
+        if keywords:
+            hits = [i for i in sig["issues"] if parse_time(i["created_at"]).timestamp() > since
+                    and not REPORT_TITLE_RE.match(i["title"]) and any(k in i["title"].lower() for k in keywords)]
+            if hits:
+                score += min(0.4 * len(hits), 1.2)
+                reasons.append(f"{len(hits)} matching issue(s) filed since ({', '.join('#%s' % i['number'] for i in hits[:5])})")
+        if t.get("release_boost") and sig.get("release"):
+            score += 1.5
+            reasons.append(sig["release"])
+    if last and last.get("counts"):
+        c = last["counts"]
+        if c.get("critical", 0) + c.get("high", 0):
+            score *= 1.25
+            reasons.append("its last run found critical/high findings")
+        elif not sum(c.values()):
+            score *= 0.75
+            reasons.append("its last run found nothing")
+    if last and kind != "diff" and hours_since(last, now) < COOLDOWN_HOURS:
+        score *= 0.6 if kind in ("area", "layer") else 0.2
+        reasons.append(f"ran {hours_since(last, now):.0f} h ago")
+    return round(score, 2), reasons
+
+
+def scope_candidates(kind: str, cfg: Dict[str, Any], areas: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
+    if kind == "area":
+        out = []
+        for title, text in areas:
+            tokens = area_tokens(text)
+            out.append({"key": title, "title": title, "detail": text,
+                        "match": (lambda p, toks=tokens: any(tok in p for tok in toks))})
+        return out
+    return [{"key": key, "title": layer["title"], "detail": ", ".join(layer["paths"]),
+             "match": (lambda p, pats=layer["paths"]: in_paths(p, pats))} for key, layer in cfg["layers"].items()]
+
+
+def choose_scope(name: str, t: Dict[str, Any], cfg: Dict[str, Any], ledger: List[Entry], sig: Dict[str, Any],
+                 now: dt.datetime, areas: List[Tuple[str, str]], wanted: Optional[str] = None) -> Dict[str, Any]:
+    kind = t["scope"]
+    if kind == "app":
+        return {"key": "app", "title": "whole app", "detail": None, "reason": None}
+    if kind == "diff":
+        base, head, n = sig["regression_base"], sig["head"], sig["regression_commits"]
+        return {"key": "diff", "title": f"{base[:8]}..{head[:8]} ({n} commits)", "detail": None, "reason": None, "base": base}
+    best = None
+    for idx, cand in enumerate(scope_candidates(kind, cfg, areas)):
+        if wanted and wanted.lower() not in (cand["key"].lower(), cand["title"].lower()):
+            continue
+        last = last_entry(ledger, name, cand["key"])
+        since = parse_time(last["at"]).timestamp() if last else (now - dt.timedelta(days=SCOPE_WINDOW_DAYS)).timestamp()
+        age = min(hours_since(last, now) / 24, 60) if last else 60
+        files, _ = files_changed_since(sig["history"], since, cand["match"])
+        score = age / 30 + min(files, 40) / 20
+        why = (f"{files} file(s) changed since its last {name} review {age:.0f} days ago" if last
+               else f"never reviewed by {name}; {files} file(s) changed in the last {SCOPE_WINDOW_DAYS} days")
+        if best is None or score > best[0]:
+            best = (score, idx, {**{k: v for k, v in cand.items() if k != "match"}, "reason": why})
+    if best is None:
+        raise SystemExit(f"review-next: no {kind} named {wanted!r} for {name}")
+    return best[2]
+
+
+def plan(cfg: Dict[str, Any], ledger: List[Entry], sig: Dict[str, Any], now: dt.datetime,
+         areas: List[Tuple[str, str]], count: int, forced: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], List[Tuple[float, str, List[str]]]]:
+    scores = []
+    for name, t in cfg["types"].items():
+        s, why = score_type(name, t, cfg, ledger, sig, now)
+        scores.append((s, name, why))
+    scores.sort(key=lambda x: -x[0])
+    if forced:
+        chosen = []
+        for item in forced:
+            name, _, wanted = item.partition(":")
+            if name not in cfg["types"]:
+                raise SystemExit(f"review-next: unknown review type {name!r} (known: {', '.join(cfg['types'])})")
+            if cfg["types"][name]["scope"] == "diff" and not sig["regression_commits"]:
+                raise SystemExit("review-next: no unreviewed commits for a regression review")
+            chosen.append((name, ["requested"], wanted or None))
+    else:
+        chosen = [(name, why, None) for s, name, why in scores if s > 0][:count]
+    picks = []
+    for name, why, wanted in chosen:
+        t = cfg["types"][name]
+        scope = choose_scope(name, t, cfg, ledger, sig, now, areas, wanted)
+        reasons = why + ([scope["reason"]] if scope.get("reason") else [])
+        picks.append({"type": name, "kind": t["scope"], "scope": scope, "reasons": reasons,
+                      "deliver": "print" if t["scope"] in NARROW_SCOPES else "issue"})
+    return picks, scores
+
+
+# ---------------------------------------------------------------- running reviews
+
+def parse_counts(report: str) -> Dict[str, int]:
+    counts = {}
+    for sev in SEVERITIES:
+        found = re.findall(rf"(\d+)\s+{sev}\b", report, re.I)
+        if found:
+            counts[sev] = int(found[-1])
+    if not counts:
+        for sev in SEVERITIES:
+            counts[sev] = len(re.findall(rf"severity\W{{0,3}}\s*{sev}\b", report, re.I))
+    return {sev: counts.get(sev, 0) for sev in SEVERITIES}
+
+
+def prepare_worktree(cfg: Dict[str, Any], state: Path, head: str) -> Path:
+    repo, wt = expand(cfg["repo"]), state / "worktree"
+    if not wt.exists():
+        git(repo, "worktree", "add", "-q", "--detach", str(wt), head)
+    git(wt, "checkout", "-q", "--detach", head)
+    git(wt, "clean", "-fdq")
+    return wt
+
+
+def write_inputs(wt: Path, picks: List[Dict[str, Any]], types_dir: Path, cfg: Dict[str, Any], sig: Dict[str, Any]) -> Dict[str, str]:
+    d = wt / ".review"
+    (d / "types").mkdir(parents=True, exist_ok=True)
+    (d / "common.md").write_text((types_dir / "common.md").read_text())
+    for p in picks:
+        (d / "types" / f"{p['type']}.md").write_text((types_dir / f"{p['type']}.md").read_text())
+    (d / "known-issues.md").write_text("".join(f"#{i['number']} [{i['state']}] {i['title']}\n" for i in sig["issues"]))
+    notes: Dict[str, str] = {}
+    for p in picks:
+        if p["kind"] != "diff":
+            continue
+        rng = f"{p['scope']['base']}..{sig['head']}"
+        (d / "commits.txt").write_text(git(wt, "log", "--oneline", rng))
+        diff = git(wt, "diff", rng, "--", *diff_pathspec(cfg))
+        notes["diff"] = ""
+        if len(diff) > DIFF_LIMIT:
+            diff = diff[:DIFF_LIMIT]
+            (d / "files.txt").write_text(git(wt, "diff", "--stat=200", rng, "--", *diff_pathspec(cfg)))
+            notes["diff"] = " (truncated at 400 KB; for the rest, read the changed files listed in `.review/files.txt`)"
+        (d / "changes.diff").write_text(diff)
+    return notes
+
+
+def brief(p: Dict[str, Any], cfg: Dict[str, Any], head: str, notes: Dict[str, str]) -> str:
+    app, s = cfg["app"], p["scope"]
+    lines = [
+        f"Review type: {p['type']}. Scope: {s['title']}.",
+        "",
+        f"Repository: {app}, checked out read-only at {head[:8]} in the current directory. If it has agent instructions "
+        "(CLAUDE.md, AGENTS.md), read them first.",
+        f"Before you start, read `.review/common.md` and `.review/types/{p['type']}.md` and follow them; they take "
+        "precedence over other review instructions you may have. Ignore the rest of `.review/` except the files named here.",
+        f"Already known: `.review/known-issues.md` lists every {app} issue (open and closed) as \"#N [state] title\".",
+    ]
+    if p["kind"] == "diff":
+        lines.append(f"The commits under review are listed in `.review/commits.txt` and their diff "
+                     f"is in `.review/changes.diff`{notes.get('diff', '')}.")
+    elif s.get("detail"):
+        lines.append(f"Scope details: {s['detail']}")
+    # Every turn re-reads the whole conversation, so cost grows with turns times context: keep turns few and full.
+    lines.append("Work in few turns: each turn, issue all the file reads and searches you already know you need (5-10 at "
+                 "once), not one at a time. Do not read the same file twice; read only the relevant ranges of large files. "
+                 "Aim to finish within about 40 turns.")
+    lines.append(f"Start your report with the line \"Review type: {p['type']}; scope: {s['title']}\".")
+    return "\n".join(lines)
+
+
+def reviewer_result(out: Path, output: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """(report or None when the run failed, usage) from a reviewer's captured stdout."""
+    try:
+        text = out.read_text()
+    except OSError:
+        return None, {}
+    usage: Dict[str, Any] = {}
+    if output == "claude-json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None, {}
+        if data.get("is_error"):
+            return None, {}
+        text = data.get("result") or ""
+        usage = {"cost_usd": round(data.get("total_cost_usd") or 0, 2), "turns": data.get("num_turns")}
+    if not text.strip() or LIMIT_RE.search("\n".join(text.strip().splitlines()[:3])):
+        return None, {}
+    return text, usage
+
+
+def reviewer_env(reviewer: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The environment for one reviewer; None when it needs an API key that isn't available."""
+    env = {k: v for k, v in os.environ.items() if k not in reviewer.get("unset_env", [])}
+    key_command = reviewer.get("api_key_command")
+    if key_command:
+        res = subprocess.run(key_command, capture_output=True, text=True)
+        key = res.stdout.strip() if res.returncode == 0 else ""
+        if not key:
+            return None
+        env[reviewer.get("api_key_env", "ANTHROPIC_API_KEY")] = key
+    return env
+
+
+def run_reviewer(text: str, wt: Path, out: Path, model: str, effort: str, reviewers: List[Dict[str, Any]],
+                 log: Path) -> Tuple[Optional[str], str, Dict[str, Any]]:
+    """Each reviewer in turn until one produces a report: (report, label of the reviewer used, usage)."""
+    values = {"{model}": model, "{effort}": effort, "{prompt}": text}
+    for reviewer in reviewers:
+        label = reviewer.get("label", reviewer["command"][0])
+        env = reviewer_env(reviewer)
+        if env is None:
+            with log.open("a") as err:
+                err.write(f"{dt.datetime.now().isoformat(timespec='seconds')} {label} skipped: no API key\n")
+            continue
+        cmd = [values.get(a, a) for a in reviewer["command"]]
+        with out.open("w") as f, log.open("a") as err:
+            subprocess.run(cmd, cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=f, stderr=err)
+        report, usage = reviewer_result(out, reviewer.get("output", "text"))
+        if report:
+            return report, label, usage
+        with log.open("a") as err:
+            err.write(f"{dt.datetime.now().isoformat(timespec='seconds')} {label} failed for {out.name}\n")
+    return None, "none (all reviewers failed)", {}
+
+
+def section(n: int, p: Dict[str, Any], report: Optional[str]) -> str:
+    head = f"## {n}. {TITLES.get(p['type'], p['type'])}: {p['scope']['title']}\n\nChosen because: {'; '.join(p['reasons'])}."
+    if p["kind"] == "area" and p["scope"].get("detail"):
+        head += f"\n\nScope: {p['scope']['detail']}"
+    return head + "\n\n" + (report.strip() if report else "The review failed; it will be picked again next time.")
+
+
+def fit_body(intro: str, sections: List[str], footer: str, report: Path, limit: int = ISSUE_BODY_LIMIT) -> str:
+    """The issue body, with the sections cut at the end when the whole would exceed the tracker's size limit."""
+    body = "\n\n".join([intro, *sections, footer])
+    if len(body) <= limit:
+        return body
+    note = f"\n\n*(Cut to fit the issue size limit; the full report is `{report}`.)*"
+    room = limit - len(intro) - len(footer) - len(note) - 4
+    return "\n\n".join([intro, "\n\n".join(sections)[:max(room, 0)].rstrip() + note, footer])
+
+
+def nightly_issues(intro: str, sections: List[str], footer: str, report: Path,
+                   limit: int = ISSUE_BODY_LIMIT) -> List[Tuple[List[int], str]]:
+    """(section indexes, body) per issue: one combined issue when it fits, otherwise one issue per review."""
+    combined = "\n\n".join([intro, *sections, footer])
+    if len(combined) <= limit:
+        return [(list(range(len(sections))), combined)]
+    return [([i], fit_body(intro, [sec], footer, report, limit)) for i, sec in enumerate(sections)]
+
+
+def file_issue(cfg: Dict[str, Any], title: str, body: str, request_id: str,
+               known: List[Dict[str, Any]]) -> Tuple[Optional[str], str]:
+    """(issue ref or None when it wasn't filed, a line describing the outcome)."""
+    issues_cfg = cfg.get("issues") or {}
+    repo = issues_cfg.get("repo")
+    if not repo:
+        return "report", "not filed (the plan has no issue repo); kept in the report file"
+    command = (issues_cfg.get("command") or {}).get("create")
+    if command:
+        req = {"repo": repo, "title": title, "body": body, "labels": issues_cfg.get("labels", []), "request_id": request_id}
+        res = subprocess.run(command, input=json.dumps(req), capture_output=True, text=True)
+        if res.returncode != 0:
+            return None, f"issue creation failed ({res.stderr.strip()[:200] or res.stdout.strip()[:200]})"
+        issue = json.loads(res.stdout)
+        return issue.get("ref"), f"{issue.get('ref')} {issue.get('url')}"
+    # gh: a rerun of the same report (same title) doesn't file it twice.
+    for issue in known:
+        if issue["state"] == "open" and issue["title"] == title:
+            return f"#{issue['number']}", f"#{issue['number']} (already filed)"
+    cmd = ["gh", "issue", "create", "-R", repo, "--title", title, "--body-file", "-"]
+    for label in issues_cfg.get("labels", []):
+        cmd += ["--label", label]
+    res = subprocess.run(cmd, input=body, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None, f"issue creation failed ({res.stderr.strip()[:200]})"
+    url = res.stdout.strip().splitlines()[-1]
+    return "#" + url.rstrip("/").rsplit("/", 1)[-1], url
+
+
+# ---------------------------------------------------------------- main
+
+def print_plan(picks: List[Dict[str, Any]], scores: List[Tuple[float, str, List[str]]]) -> None:
+    print("Scores:")
+    for s, name, why in scores:
+        print(f"  {s:5.2f}  {name:18} {'; '.join(why)}")
+    print("\nPicks:")
+    for n, p in enumerate(picks, 1):
+        print(f"  {n}. {p['type']} on {p['scope']['title']} -> {p['deliver']}\n     because: {'; '.join(p['reasons'])}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="review-next", description=__doc__.split("\n\n")[0])
+    ap.add_argument("plan_file", metavar="PLAN", help="review-plan.json, its directory, or a name under " + str(CONFIG_HOME))
+    ap.add_argument("--count", type=int, default=2)
+    ap.add_argument("--plan", action="store_true", help="show scores and picks; run nothing")
+    ap.add_argument("--type", action="append", help="TYPE[:SCOPE] to run instead of picking (repeatable)")
+    ap.add_argument("--record", action="append", help="TYPE[:SCOPE] reviewed some other way; logs it in the ledger at the plan's ref")
+    ap.add_argument("--nightly", action="store_true", help="scheduled mode: once a day, one combined issue")
+    ap.add_argument("--deliver", choices=("auto", "issue", "print"), default="auto")
+    ap.add_argument("--dry", action="store_true", help="cheap model, no issue, no ledger")
+    ap.add_argument("--force", action="store_true", help="with --nightly, run again on the same day")
+    ap.add_argument("--version", action="version", version=f"review-next {VERSION}")
+    args = ap.parse_args(argv)
+
+    cfg = load_plan(args.plan_file)
+    state = plan_path(cfg, cfg["state_dir"]) if cfg.get("state_dir") else STATE_HOME / cfg["name"]
+    (state / "reports").mkdir(parents=True, exist_ok=True)
+    with (state / "lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"review-next: another {cfg['name']} review is running", file=sys.stderr)
+            return 0
+        return run(args, cfg, state)
+
+
+def run(args: argparse.Namespace, cfg: Dict[str, Any], state: Path) -> int:
+    ledger_path, log = state / "ledger.jsonl", state / "reviewer.err"
+    areas = parse_areas(plan_path(cfg, cfg["areas_file"]).read_text()) if cfg.get("areas_file") else []
+    ledger = read_ledger(ledger_path)
+    now = dt.datetime.now(dt.timezone.utc)
+    today = now.astimezone().strftime("%Y-%m-%d")
+    if args.nightly and not (args.force or args.dry) and any(e.get("mode") == "nightly" and e["at"][:10] == today for e in ledger):
+        print("review-next: the nightly review already ran today")
+        return 0
+
+    sig = gather(cfg, ledger, now)
+    if args.record:
+        entries = []
+        for item in args.record:
+            name, _, scope = item.partition(":")
+            if name not in cfg["types"]:
+                raise SystemExit(f"review-next: unknown review type {name!r}")
+            kind = cfg["types"][name]["scope"]
+            if kind in ("area", "layer") and not scope:
+                raise SystemExit(f"review-next: --record {name} needs a {kind} name, as {name}:<{kind}>")
+            entries.append({"at": now.isoformat(timespec="seconds"), "type": name, "head": sig["head"], "mode": "recorded",
+                            "scope": "app" if kind == "app" else "diff" if kind == "diff" else
+                            choose_scope(name, cfg["types"][name], cfg, ledger, sig, now, areas, scope or None)["key"]})
+        append_ledger(ledger_path, entries)
+        for e in entries:
+            print(f"recorded {e['type']} on {e['scope']} at {e['head'][:8]}")
+        return 0
+
+    picks, scores = plan(cfg, ledger, sig, now, areas, args.count, args.type)
+    if args.plan or not picks:
+        print_plan(picks, scores)
+        return 0
+    types_dir = plan_path(cfg, cfg["types_dir"]) if cfg.get("types_dir") else HERE / "review-types"
+    missing = [n for n in ["common"] + [p["type"] for p in picks] if not (types_dir / f"{n}.md").exists()]
+    if missing:
+        raise SystemExit(f"review-next: {types_dir} lacks {', '.join(missing)}.md")
+
+    model = cfg.get("dry_model", "haiku") if args.dry else cfg.get("model", "opus")
+    effort = cfg.get("dry_effort", "low") if args.dry else cfg.get("effort", "medium")
+    reviewers = cfg.get("reviewers") or DEFAULT_REVIEWERS
+    wt = prepare_worktree(cfg, state, sig["head"])
+    notes = write_inputs(wt, picks, types_dir, cfg, sig)
+    stamp = now.astimezone().strftime("%Y-%m-%d-%H%M")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(picks)) as pool:
+        futures = [pool.submit(run_reviewer, brief(p, cfg, sig["head"], notes), wt, state / f"out-{n}.json",
+                               model, effort, reviewers, log)
+                   for n, p in enumerate(picks, 1)]
+        results = [f.result() for f in futures]
+    git(wt, "clean", "-fdq")
+
+    used = sorted({label for _, label, _ in results})
+    intro = (f"Read-only review of {cfg['app']} at `{sig['head'][:8]}`, {today}. Reviewer: {'; '.join(used)}, {model} at "
+             f"{effort} effort. Findings come from reading code only; PLAUSIBLE ones need confirming before a fix.")
+    footer = "---\n" + (cfg["issue_footer"].strip() + " " if cfg.get("issue_footer") else "") + (
+        f"Picked by review-next ([agent-review-scheduler](https://github.com/jnersn/agent-review-scheduler)); "
+        f"`{cfg['path'].name}` sets the cadences, layers and areas.")
+    limit = (cfg.get("issues") or {}).get("body_limit", ISSUE_BODY_LIMIT)
+    deliver = ["issue" if args.nightly else (p["deliver"] if args.deliver == "auto" else args.deliver) for p in picks]
+    sections = [section(n, p, r) for n, (p, (r, _, _)) in enumerate(zip(picks, results), 1)]
+    report = state / "reports" / f"{stamp}.md"
+    report.write_text("\n\n".join([intro, *sections, footer]) + "\n")
+
+    delivered: List[str] = ["report"] * len(picks)
+    if args.dry:
+        print("\n\n".join([intro, *sections]))
+        return 0
+    if args.nightly:
+        groups = nightly_issues(intro, sections, footer, report, limit)
+        for idx, body in groups:
+            title = f"Nightly review {today}: " + ", ".join(f"{picks[i]['type']} ({picks[i]['scope']['title']})" for i in idx)
+            request_id = f"{cfg['name']}-nightly-review-{today}-{sig['head'][:8]}" + ("" if len(groups) == 1 else f"-{picks[idx[0]]['type']}")
+            ref, where = file_issue(cfg, title, body, request_id, sig["issues"])
+            print(f"Filed: {where}")
+            for i in idx:
+                delivered[i] = ref or "failed"
+    else:
+        print(intro)
+        for i, (p, sec) in enumerate(zip(picks, sections)):
+            if deliver[i] == "print":
+                print("\n" + sec)
+                delivered[i] = "print"
+            else:
+                title = f"Review {today}: {TITLES.get(p['type'], p['type'])} ({p['scope']['title']})"
+                ref, where = file_issue(cfg, title, fit_body(intro, [sec], footer, report, limit),
+                                        f"{cfg['name']}-review-{stamp}-{p['type']}-{re.sub(r'[^a-z0-9]+', '-', p['scope']['key'].lower())}",
+                                        sig["issues"])
+                print(f"\n## {i + 1}. {TITLES.get(p['type'], p['type'])}: {p['scope']['title']}\nChosen because: {'; '.join(p['reasons'])}.\nFiled: {where}")
+                delivered[i] = ref or "failed"
+    if "report" in delivered:
+        print(f"\nReport: {report}")
+
+    append_ledger(ledger_path, [
+        {"at": now.isoformat(timespec="seconds"), "type": p["type"], "scope": p["scope"]["key"], "head": sig["head"],
+         "mode": "nightly" if args.nightly else "manual", "counts": parse_counts(r), "delivered": d,
+         **usage, "effort": effort}
+        for (p, (r, _, usage), d) in zip(picks, results, delivered) if r])
+    # A review that failed, or a report that could not be filed, makes the run fail, so the scheduler shows it.
+    return 0 if all(r for r, _, _ in results) and "failed" not in delivered else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

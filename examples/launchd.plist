@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Nightly review on macOS. Replace PLAN and HOME_DIR, save as
+     ~/Library/LaunchAgents/agent-review-scheduler.PLAN.plist, then:
+     launchctl bootstrap gui/$UID ~/Library/LaunchAgents/agent-review-scheduler.PLAN.plist -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>agent-review-scheduler.PLAN</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>HOME_DIR/.local/bin/review-next</string>
+		<string>PLAN</string>
+		<string>--nightly</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>HOME_DIR/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>2</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>HOME_DIR/.local/state/agent-review-scheduler/PLAN.log</string>
+	<key>StandardErrorPath</key>
+	<string>HOME_DIR/.local/state/agent-review-scheduler/PLAN.log</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+</dict>
+</plist>

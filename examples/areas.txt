@@ -1,0 +1,9 @@
+# One narrow review area per line: "Title | scope and things to look for". Area bug hunts pick
+# the area with the most changed files and the longest time since its last review; the ledger
+# keeps that by title, so renaming a title resets its history. Paths and CamelCase names in the
+# scope are matched against changed files.
+Sign-up and login | src/api/auth/, src/ui/auth/, SessionStore: expired sessions, double submits, password reset links used twice, login from two tabs
+Checkout and payments | src/api/checkout/, src/services/payments/, PaymentWebhookHandler: retries, duplicate webhooks, partial refunds, currency rounding
+Search | src/api/search/, src/ui/search/: special characters, empty queries, pagination past the end, results after edits
+File uploads | src/api/uploads/, src/services/storage/: huge and empty files, unusual names, interrupted uploads, cleanup of orphaned files
+Background jobs | src/jobs/, JobScheduler: jobs that overlap, retries after partial work, cancellation, jobs for deleted records

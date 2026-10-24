@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly code review of %i (agent-review-scheduler)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

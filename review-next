@@ -5,8 +5,8 @@
   review-next PLAN --plan           show the scores and the picks; run nothing
   review-next PLAN --type maintainability[:services]   run named types instead of picking
   review-next PLAN --record unused-code [--record maintainability:ui]   log reviews done some other way
-  review-next PLAN --nightly        the scheduled job: once a day, one combined issue
-  --dry                             cheap model, no issue, no ledger; prints the reports
+  review-next PLAN --nightly        the scheduled job: once a day, an issue per finding worth one
+  --dry                             cheap model, no issue, no ledger; prints the reports and the triage
 
 PLAN is a review-plan.json file, a directory holding one, or a name looked up as
 ~/.config/agent-review-scheduler/<name>/review-plan.json. The plan sets each review type's cadence and
@@ -19,7 +19,10 @@ the code and its docs since the type last ran, recent issues that match the type
 soon, what the last run of the type found, and a cooldown so repeated runs move on.
 
 Delivery: area and diff reviews (narrow) are printed; layer and app reviews (general) are filed as issues.
---nightly files everything as one issue. Every review is appended to the ledger (ledger.jsonl in the state
+--nightly files each finding that is worth it as its own issue: findings that are neither confirmed nor high or
+critical stay in the report, a triage agent re-checks the rest against the code and the known issues, and at most
+`max_issues` (default 3) are filed a night. The full report, with the triage, is a file in the state directory.
+Every review is appended to the ledger (ledger.jsonl in the state
 directory), which the next pick reads.
 """
 from __future__ import annotations
@@ -36,7 +39,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "agent-review-scheduler"
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "agent-review-scheduler"
@@ -51,6 +54,9 @@ TITLES = {
 NEVER_RUN_SCORE = 1.5
 MAX_OVERDUE = 3.0
 ISSUE_BODY_LIMIT = 65000  # GitHub refuses bodies over 65536 characters
+MAX_NIGHTLY_ISSUES = 3
+JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n```", re.S)
+ISSUE_NUMBER_RE = re.compile(r"#(\d+)$")
 COOLDOWN_HOURS = 12
 SCOPE_WINDOW_DAYS = 30
 RELEASE_WINDOW_DAYS = 21
@@ -255,6 +261,17 @@ def gather(cfg: Dict[str, Any], ledger: List[Entry], now: dt.datetime) -> Dict[s
             "issues": issues, "release": release_signal(issues, now)}
 
 
+def filed_numbers(ledger: List[Entry]) -> set:
+    """Numbers of the issues review-next filed for findings (the ledger's `delivered` lists)."""
+    out = set()
+    for e in ledger:
+        for ref in e.get("delivered") if isinstance(e.get("delivered"), list) else []:
+            m = ISSUE_NUMBER_RE.search(str(ref))
+            if m:
+                out.add(int(m.group(1)))
+    return out
+
+
 # ---------------------------------------------------------------- scoring
 
 def score_type(name: str, t: Dict[str, Any], cfg: Dict[str, Any], ledger: List[Entry], sig: Dict[str, Any],
@@ -291,8 +308,10 @@ def score_type(name: str, t: Dict[str, Any], cfg: Dict[str, Any], ledger: List[E
                 reasons.append(f"{docs} doc file(s) changed since")
         keywords = t.get("issue_keywords")
         if keywords:
+            own = filed_numbers(ledger)
             hits = [i for i in sig["issues"] if parse_time(i["created_at"]).timestamp() > since
-                    and not REPORT_TITLE_RE.match(i["title"]) and any(k in i["title"].lower() for k in keywords)]
+                    and not REPORT_TITLE_RE.match(i["title"]) and i["number"] not in own
+                    and any(k in i["title"].lower() for k in keywords)]
             if hits:
                 score += min(0.4 * len(hits), 1.2)
                 reasons.append(f"{len(hits)} matching issue(s) filed since ({', '.join('#%s' % i['number'] for i in hits[:5])})")
@@ -391,6 +410,47 @@ def parse_counts(report: str) -> Dict[str, int]:
         for sev in SEVERITIES:
             counts[sev] = len(re.findall(rf"severity\W{{0,3}}\s*{sev}\b", report, re.I))
     return {sev: counts.get(sev, 0) for sev in SEVERITIES}
+
+
+def last_json_block(text: str) -> Tuple[Optional[Any], Optional[re.Match]]:
+    blocks = list(JSON_BLOCK_RE.finditer(text))
+    if not blocks:
+        return None, None
+    try:
+        return json.loads(blocks[-1].group(1)), blocks[-1]
+    except ValueError:
+        return None, blocks[-1]
+
+
+def parse_findings(report: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    """(the report's prose, its findings sorted by severity) from a reviewer's reply. The findings are None when the
+    reply has no valid findings block; the prose is then the whole reply."""
+    data, m = last_json_block(report)
+    raw = data.get("findings") if isinstance(data, dict) else None
+    if m is None or not isinstance(raw, list):
+        return report.strip(), None
+    findings = []
+    for f in raw:
+        if not isinstance(f, dict) or not str(f.get("title", "")).strip():
+            continue
+        sev = str(f.get("severity", "")).strip().lower()
+        findings.append({"title": str(f["title"]).strip().strip("*").strip().rstrip("."),
+                         "severity": sev if sev in SEVERITIES else "low",
+                         "confidence": "CONFIRMED" if str(f.get("confidence", "")).strip().upper() == "CONFIRMED" else "PLAUSIBLE",
+                         "body": str(f.get("body", "")).strip()})
+    findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
+    return (report[:m.start()] + report[m.end():]).strip(), findings
+
+
+def count_findings(findings: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {sev: sum(f["severity"] == sev for f in findings) for sev in SEVERITIES}
+
+
+def needs_triage(f: Dict[str, Any]) -> Optional[str]:
+    """None when a finding goes on to triage, otherwise why it stays in the report."""
+    if f["confidence"] != "CONFIRMED" and f["severity"] in ("medium", "low"):
+        return "not confirmed, and below high severity"
+    return None
 
 
 def prepare_worktree(cfg: Dict[str, Any], state: Path, head: str) -> Path:
@@ -505,11 +565,22 @@ def run_reviewer(text: str, wt: Path, out: Path, model: str, effort: str, review
     return None, "none (all reviewers failed)", {}
 
 
+def finding_md(f: Dict[str, Any]) -> str:
+    return f"Severity: {f['severity']}. Confidence: {f['confidence']}.\n\n{f['body']}".strip()
+
+
 def section(n: int, p: Dict[str, Any], report: Optional[str]) -> str:
     head = f"## {n}. {TITLES.get(p['type'], p['type'])}: {p['scope']['title']}\n\nChosen because: {'; '.join(p['reasons'])}."
     if p["kind"] == "area" and p["scope"].get("detail"):
         head += f"\n\nScope: {p['scope']['detail']}"
-    return head + "\n\n" + (report.strip() if report else "The review failed; it will be picked again next time.")
+    if not report:
+        return head + "\n\nThe review failed; it will be picked again next time."
+    prose, findings = parse_findings(report)
+    if findings is None:
+        return head + "\n\n" + prose
+    c = count_findings(findings)
+    body = "".join(f"\n\n### {n}.{i}. {f['title']}\n\n{finding_md(f)}" for i, f in enumerate(findings, 1)) or "\n\nNo findings."
+    return (head + "\n\n" + prose + body + "\n\n" + ", ".join(f"{c[s]} {s}" for s in SEVERITIES) + ".").strip()
 
 
 def fit_body(intro: str, sections: List[str], footer: str, report: Path, limit: int = ISSUE_BODY_LIMIT) -> str:
@@ -522,25 +593,17 @@ def fit_body(intro: str, sections: List[str], footer: str, report: Path, limit: 
     return "\n\n".join([intro, "\n\n".join(sections)[:max(room, 0)].rstrip() + note, footer])
 
 
-def nightly_issues(intro: str, sections: List[str], footer: str, report: Path,
-                   limit: int = ISSUE_BODY_LIMIT) -> List[Tuple[List[int], str]]:
-    """(section indexes, body) per issue: one combined issue when it fits, otherwise one issue per review."""
-    combined = "\n\n".join([intro, *sections, footer])
-    if len(combined) <= limit:
-        return [(list(range(len(sections))), combined)]
-    return [([i], fit_body(intro, [sec], footer, report, limit)) for i, sec in enumerate(sections)]
-
-
 def file_issue(cfg: Dict[str, Any], title: str, body: str, request_id: str,
-               known: List[Dict[str, Any]]) -> Tuple[Optional[str], str]:
-    """(issue ref or None when it wasn't filed, a line describing the outcome)."""
+               known: List[Dict[str, Any]], labels: Optional[List[str]] = None) -> Tuple[Optional[str], str]:
+    """(issue ref or None when it wasn't filed, a line describing the outcome). `labels` defaults to the plan's."""
     issues_cfg = cfg.get("issues") or {}
+    labels = issues_cfg.get("labels", []) if labels is None else labels
     repo = issues_cfg.get("repo")
     if not repo:
         return "report", "not filed (the plan has no issue repo); kept in the report file"
     command = (issues_cfg.get("command") or {}).get("create")
     if command:
-        req = {"repo": repo, "title": title, "body": body, "labels": issues_cfg.get("labels", []), "request_id": request_id}
+        req = {"repo": repo, "title": title, "body": body, "labels": labels, "request_id": request_id}
         res = subprocess.run(command, input=json.dumps(req), capture_output=True, text=True)
         if res.returncode != 0:
             return None, f"issue creation failed ({res.stderr.strip()[:200] or res.stdout.strip()[:200]})"
@@ -551,13 +614,83 @@ def file_issue(cfg: Dict[str, Any], title: str, body: str, request_id: str,
         if issue["state"] == "open" and issue["title"] == title:
             return f"#{issue['number']}", f"#{issue['number']} (already filed)"
     cmd = ["gh", "issue", "create", "-R", repo, "--title", title, "--body-file", "-"]
-    for label in issues_cfg.get("labels", []):
+    for label in labels:
         cmd += ["--label", label]
     res = subprocess.run(cmd, input=body, capture_output=True, text=True)
     if res.returncode != 0:
         return None, f"issue creation failed ({res.stderr.strip()[:200]})"
     url = res.stdout.strip().splitlines()[-1]
     return "#" + url.rstrip("/").rsplit("/", 1)[-1], url
+
+
+# ---------------------------------------------------------------- nightly triage
+
+def triage(cands: List[Dict[str, Any]], cfg: Dict[str, Any], head: str, wt: Path, state: Path, types_dir: Path,
+           model: str, effort: str, reviewers: List[Dict[str, Any]], log: Path) -> Tuple[Optional[Dict[str, Dict[str, Any]]], str]:
+    """({finding id: {decision, issue, reason}} or None when triage failed, a line on who ran it and its cost)."""
+    d = wt / ".review"
+    rules = types_dir / "triage.md" if (types_dir / "triage.md").exists() else HERE / "review-types" / "triage.md"
+    (d / "triage.md").write_text(rules.read_text())
+    (d / "candidates.json").write_text(json.dumps(
+        [{"id": c["id"], "review": c["review"], **{k: c[k] for k in ("title", "severity", "confidence", "body")}}
+         for c in cands], indent=2))
+    app = cfg["app"]
+    text = "\n".join([
+        f"You triage findings from read-only code reviews of {app}. The repository is checked out read-only at "
+        f"{head[:8]} in the current directory.",
+        "Read `.review/triage.md` and follow it. The findings are in `.review/candidates.json`; every known "
+        f"{app} issue (open and closed) is in `.review/known-issues.md` as \"#N [state] title\". Ignore the rest of `.review/`.",
+        "Work in few turns: each turn, issue all the file reads and searches you already know you need, not one at a "
+        "time. Aim to finish within about 30 turns."])
+    reply, label, usage = run_reviewer(text, wt, state / "out-triage.json", model, effort, reviewers, log)
+    who = f"{label}, {model} at {effort} effort" + (f", ${usage['cost_usd']:.2f}" if usage.get("cost_usd") is not None else "")
+    data, _ = last_json_block(reply or "")
+    raw = data.get("decisions") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None, who
+    out = {}
+    for item in raw:
+        if isinstance(item, dict) and item.get("decision") in ("file", "duplicate", "skip"):
+            out[str(item.get("id"))] = {"decision": item["decision"], "issue": item.get("issue"),
+                                       "reason": str(item.get("reason", "")).strip() or "no reason given"}
+    return out, who
+
+
+def decide(findings: List[Dict[str, Any]], decisions: Optional[Dict[str, Dict[str, Any]]], cap: int) -> None:
+    """Sets each finding's `outcome` (file, duplicate, skip) and `reason`: the rule filter, then triage, then the cap."""
+    for f in findings:
+        rule = needs_triage(f)
+        if rule:
+            f["outcome"], f["reason"] = "skip", rule
+        elif decisions is None:
+            f["outcome"], f["reason"] = "skip", "triage failed; not filed"
+        else:
+            d = decisions.get(f["id"]) or {"decision": "skip", "reason": "triage gave no decision"}
+            f["outcome"], f["reason"], f["issue"] = d["decision"], d["reason"], d.get("issue")
+    filed = sorted((f for f in findings if f["outcome"] == "file"), key=lambda f: SEVERITIES.index(f["severity"]))
+    for f in filed[cap:]:
+        f["outcome"], f["reason"] = "skip", f"over the nightly limit of {cap} issue(s); {f['reason']}"
+
+
+def finding_issue_body(f: Dict[str, Any], p: Dict[str, Any], cfg: Dict[str, Any], head: str, today: str,
+                       report: Path, limit: int) -> str:
+    footer = ("---\n" + f"Found by the nightly {TITLES.get(p['type'], p['type']).lower()} of {cfg['app']} "
+              f"({p['scope']['title']}) at `{head[:8]}` on {today}, finding {f['id']}. Triage: {f['reason']} "
+              f"Full report: `{report}`." + (" " + cfg["issue_footer"].strip() if cfg.get("issue_footer") else ""))
+    body = finding_md(f)
+    return body[:max(limit - len(footer) - 4, 0)] + "\n\n" + footer
+
+
+def triage_md(findings: List[Dict[str, Any]], who: Optional[str]) -> str:
+    lines = ["## Triage", ""]
+    if who:
+        lines += [f"By {who}.", ""]
+    for f in findings:
+        what = {"file": "to be filed" if "ref" not in f else f"filed as {f['ref'] or 'nothing (filing failed)'}",
+                "duplicate": f"duplicate of #{f['issue']}" if f.get("issue") else "duplicate",
+                "skip": "skipped"}[f["outcome"]]
+        lines.append(f"- {f['id']} ({f['severity']}) {f['title']}: {what}. {f['reason']}")
+    return "\n".join(lines if findings else lines + ["No findings to triage."])
 
 
 # ---------------------------------------------------------------- main
@@ -578,7 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--plan", action="store_true", help="show scores and picks; run nothing")
     ap.add_argument("--type", action="append", help="TYPE[:SCOPE] to run instead of picking (repeatable)")
     ap.add_argument("--record", action="append", help="TYPE[:SCOPE] reviewed some other way; logs it in the ledger at the plan's ref")
-    ap.add_argument("--nightly", action="store_true", help="scheduled mode: once a day, one combined issue")
+    ap.add_argument("--nightly", action="store_true", help="scheduled mode: once a day, an issue per finding worth one")
     ap.add_argument("--deliver", choices=("auto", "issue", "print"), default="auto")
     ap.add_argument("--dry", action="store_true", help="cheap model, no issue, no ledger")
     ap.add_argument("--force", action="store_true", help="with --nightly, run again on the same day")
@@ -645,33 +778,70 @@ def run(args: argparse.Namespace, cfg: Dict[str, Any], state: Path) -> int:
                                model, effort, reviewers, log)
                    for n, p in enumerate(picks, 1)]
         results = [f.result() for f in futures]
+
+    parsed = [parse_findings(r) if r else ("", None) for r, _, _ in results]
+    findings: List[Dict[str, Any]] = []
+    triage_who: Optional[str] = None
+    if args.nightly:
+        for n, (p, (_, fs)) in enumerate(zip(picks, parsed), 1):
+            for i, f in enumerate(fs or [], 1):
+                findings.append({**f, "id": f"{n}.{i}", "review": f"{p['type']} ({p['scope']['title']})", "pick": n - 1})
+        cands = [f for f in findings if not needs_triage(f)]
+        decisions: Optional[Dict[str, Dict[str, Any]]] = {}
+        if cands:
+            decisions, triage_who = triage(cands, cfg, sig["head"], wt, state, types_dir,
+                                           cfg.get("dry_model", "haiku") if args.dry else cfg.get("triage_model", model),
+                                           cfg.get("dry_effort", "low") if args.dry else cfg.get("triage_effort", "low"),
+                                           reviewers, log)
+        decide(findings, decisions, int(cfg.get("max_issues", MAX_NIGHTLY_ISSUES)))
     git(wt, "clean", "-fdq")
 
     used = sorted({label for _, label, _ in results})
     intro = (f"Read-only review of {cfg['app']} at `{sig['head'][:8]}`, {today}. Reviewer: {'; '.join(used)}, {model} at "
              f"{effort} effort. Findings come from reading code only; PLAUSIBLE ones need confirming before a fix.")
-    footer = "---\n" + (cfg["issue_footer"].strip() + " " if cfg.get("issue_footer") else "") + (
+    footer = "---\n" + (cfg["issue_footer"].strip() + " " if cfg.get("issue_footer") and not args.nightly else "") + (
         f"Picked by review-next ([agent-review-scheduler](https://github.com/jnersn/agent-review-scheduler)); "
         f"`{cfg['path'].name}` sets the cadences, layers and areas.")
     limit = (cfg.get("issues") or {}).get("body_limit", ISSUE_BODY_LIMIT)
-    deliver = ["issue" if args.nightly else (p["deliver"] if args.deliver == "auto" else args.deliver) for p in picks]
+    deliver = [p["deliver"] if args.deliver == "auto" else args.deliver for p in picks]
     sections = [section(n, p, r) for n, (p, (r, _, _)) in enumerate(zip(picks, results), 1)]
     report = state / "reports" / f"{stamp}.md"
-    report.write_text("\n\n".join([intro, *sections, footer]) + "\n")
 
-    delivered: List[str] = ["report"] * len(picks)
+    def write_report() -> None:
+        extra = [triage_md(findings, triage_who)] if args.nightly else []
+        report.write_text("\n\n".join([intro, *sections, *extra, footer]) + "\n")
+
+    write_report()
+    delivered: List[Any] = ["report"] * len(picks)
+    failed = False
     if args.dry:
-        print("\n\n".join([intro, *sections]))
+        print("\n\n".join([intro, *sections] + ([triage_md(findings, triage_who)] if args.nightly else [])))
         return 0
     if args.nightly:
-        groups = nightly_issues(intro, sections, footer, report, limit)
-        for idx, body in groups:
-            title = f"Nightly review {today}: " + ", ".join(f"{picks[i]['type']} ({picks[i]['scope']['title']})" for i in idx)
-            request_id = f"{cfg['name']}-nightly-review-{today}-{sig['head'][:8]}" + ("" if len(groups) == 1 else f"-{picks[idx[0]]['type']}")
-            ref, where = file_issue(cfg, title, body, request_id, sig["issues"])
-            print(f"Filed: {where}")
-            for i in idx:
-                delivered[i] = ref or "failed"
+        print(intro)
+        severity_labels = (cfg.get("issues") or {}).get("severity_labels", {})
+        base_labels = (cfg.get("issues") or {}).get("labels", [])
+        for f in findings:
+            if f["outcome"] != "file":
+                continue
+            p = picks[f["pick"]]
+            ref, where = file_issue(cfg, f["title"], finding_issue_body(f, p, cfg, sig["head"], today, report, limit),
+                                    f"{cfg['name']}-finding-{today}-{sig['head'][:8]}-{p['type']}-{f['id']}",
+                                    sig["issues"], base_labels + severity_labels.get(f["severity"], []))
+            f["ref"] = ref
+            failed |= ref is None
+            print(f"Filed {f['id']}: {where}")
+        for n, (_, fs) in enumerate(parsed):
+            if results[n][0]:
+                delivered[n] = [f["ref"] for f in findings if f["pick"] == n and f.get("ref")]
+            if results[n][0] and fs is None:
+                failed = True  # no findings block: nothing from this review could be filed
+                print(f"Review {n + 1} returned no findings block; see the report")
+        kept = sum(f["outcome"] != "file" for f in findings)
+        print(f"{sum(bool(f.get('ref')) for f in findings)} issue(s) filed, {kept} finding(s) kept in the report"
+              + (f"; triage by {triage_who}" if triage_who else ""))
+        write_report()
+        print(f"Report: {report}")
     else:
         print(intro)
         for i, (p, sec) in enumerate(zip(picks, sections)):
@@ -685,16 +855,18 @@ def run(args: argparse.Namespace, cfg: Dict[str, Any], state: Path) -> int:
                                         sig["issues"])
                 print(f"\n## {i + 1}. {TITLES.get(p['type'], p['type'])}: {p['scope']['title']}\nChosen because: {'; '.join(p['reasons'])}.\nFiled: {where}")
                 delivered[i] = ref or "failed"
-    if "report" in delivered:
-        print(f"\nReport: {report}")
+                failed |= ref is None
+        if "report" in delivered:
+            print(f"\nReport: {report}")
 
     append_ledger(ledger_path, [
         {"at": now.isoformat(timespec="seconds"), "type": p["type"], "scope": p["scope"]["key"], "head": sig["head"],
-         "mode": "nightly" if args.nightly else "manual", "counts": parse_counts(r), "delivered": d,
+         "mode": "nightly" if args.nightly else "manual",
+         "counts": count_findings(fs) if fs is not None else parse_counts(r), "delivered": d,
          **usage, "effort": effort}
-        for (p, (r, _, usage), d) in zip(picks, results, delivered) if r])
+        for (p, (r, _, usage), (_, fs), d) in zip(picks, results, parsed, delivered) if r])
     # A review that failed, or a report that could not be filed, makes the run fail, so the scheduler shows it.
-    return 0 if all(r for r, _, _ in results) and "failed" not in delivered else 1
+    return 0 if all(r for r, _, _ in results) and not failed else 1
 
 
 if __name__ == "__main__":

@@ -97,17 +97,40 @@ review-next PLAN --type maintainability:api --type unused-code   # run these ins
 review-next PLAN --dry            # cheap model; prints the reports; no issue, no ledger entry
 review-next PLAN --deliver print  # print everything, file nothing (also: issue, auto)
 review-next PLAN --record security-privacy   # log a review you did another way
-review-next PLAN --nightly        # the scheduled run: once a day, one combined issue
+review-next PLAN --nightly        # the scheduled run: once a day, an issue per finding worth one
 ```
 
 `PLAN` is a `review-plan.json` file, a directory that holds one, or a name
 looked up as `~/.config/agent-review-scheduler/<name>/review-plan.json`.
 
 `--nightly` exits right away if a nightly run already happened that day. Use
-`--force` to run it again. The whole report goes into one issue, split into
-more than one only if it's too long for a single issue body.
+`--force` to run it again.
 
-The exit code is 1 when a review failed or a report couldn't be filed, so your
+## Nightly: one issue per finding
+
+A nightly run doesn't file the report. It files each finding that is worth an
+issue as its own issue, and keeps the full report, with a triage section, in
+`reports/` in the state directory. Reviewers end their report with the findings
+as JSON (see `common.md`), and every finding goes through three steps:
+
+1. **Rules.** A finding that is PLAUSIBLE and only medium or low stays in the
+   report.
+2. **Triage.** One more read-only agent run (rules in `review-types/triage.md`)
+   re-checks each remaining finding against the code and the known issues. It
+   marks each one `file`, `duplicate` (with the issue number) or `skip`, with a
+   one-line reason. When unsure it skips. If triage fails, nothing is filed.
+3. **Cap.** At most `max_issues` (default 3) are filed a night, the most
+   severe first. The rest stay in the report.
+
+Each issue's title is the finding's title, its body is the finding, and its
+footer names the review, the commit, the triage reason and the report file.
+Labels are `issues.labels` plus `issues.severity_labels[severity]`. The
+ledger records the filed issues, and those issues don't count as
+`issue_keywords` signals. With `--dry` the triage runs too, on the cheap
+model, and the report is printed with it; nothing is filed.
+
+The exit code is 1 when a review failed, a report or issue couldn't be
+filed, or a nightly review returned no findings block, so your
 scheduler shows the failure.
 
 ## The plan
@@ -136,6 +159,8 @@ applies to the program in a reviewer, key or issue command when it starts with
 | `types_dir` | the bundled `review-types/` | Your own review rules |
 | `state_dir` | `~/.local/state/agent-review-scheduler/<name>` | Ledger, reports, logs and the review worktree |
 | `issue_footer` | none | Text added to the end of every filed issue |
+| `max_issues` | 3 | Nightly: the most issues filed a night |
+| `triage_model`, `triage_effort` | `model`, `low` | Nightly: the triage run |
 
 Type options: `churn_boost`, `docs_boost`, `release_boost` (booleans) and
 `issue_keywords` (lowercase substrings matched against issue titles).
@@ -207,8 +232,11 @@ to `reviewer.err` in the state directory.
 ## Issues
 
 ```json
-"issues": {"repo": "example-org/example-web", "labels": ["review"]}
+"issues": {"repo": "example-org/example-web", "labels": ["review"],
+           "severity_labels": {"high": ["severity/high"], "medium": ["severity/medium"]}}
 ```
+
+`severity_labels` adds labels to nightly finding issues by severity.
 
 By default issues go to GitHub through `gh`. Existing issues, open and
 closed, are passed to the reviewer as known issues, so it doesn't report
@@ -230,7 +258,7 @@ For another tracker, set `issues.command` to your own scripts:
   `{"number", "title", "state": "open"|"closed", "created_at": ISO 8601, "milestone": {"title", "due_on"} | null}`.
 - `create` reads `{"repo", "title", "body", "labels", "request_id"}` as JSON
   on stdin and prints `{"ref", "url"}`. `request_id` is stable for the same
-  report, so you can use it to skip duplicates. A non-zero exit means the
+  report or nightly finding, so you can use it to skip duplicates. A non-zero exit means the
   issue wasn't filed.
 
 Every report is also saved under `reports/` in the state directory, whether

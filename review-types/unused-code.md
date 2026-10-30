@@ -22,4 +22,4 @@
 
 Keep deliberate test hooks that are documented as such. Check the roadmap and open issues: code waiting for planned work is not dead (see common.md).
 
-**Output:** group the findings as "unused anywhere", "used only by tests" and "only behind a flag or configuration". Give the number of raw candidates and the number you verified.
+**Output:** start each finding's body with its group: "unused anywhere", "used only by tests" or "only behind a flag or configuration". In the summary, give the number of raw candidates and the number you verified.

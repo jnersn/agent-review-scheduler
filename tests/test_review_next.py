@@ -190,15 +190,43 @@ class Reports(unittest.TestCase):
         self.assertIn("Scope details: src/services/", text)
         self.assertNotIn("changes.diff", text)
 
-    def test_nightly_report_is_one_issue_when_it_fits(self):
-        groups = rn.nightly_issues("intro", ["one", "two"], "footer", Path("/r.md"), limit=100)
-        self.assertEqual(groups, [([0, 1], "intro\n\none\n\ntwo\n\nfooter")])
+    def test_findings_come_from_the_last_json_block_sorted_by_severity(self):
+        reply = ('Review type: x\n\nSummary.\n\n```json\n{"findings": ['
+                 '{"title": "**Small thing.**", "severity": "LOW", "confidence": "confirmed", "body": "B1"},'
+                 '{"title": "Big thing", "severity": "high", "confidence": "plausible", "body": "B2"},'
+                 '{"severity": "low"}]}\n```\n')
+        prose, findings = rn.parse_findings(reply)
+        self.assertEqual(prose, "Review type: x\n\nSummary.")
+        self.assertEqual([(f["title"], f["severity"], f["confidence"]) for f in findings],
+                         [("Big thing", "high", "PLAUSIBLE"), ("Small thing", "low", "CONFIRMED")])
+        self.assertEqual(rn.count_findings(findings), {"critical": 0, "high": 1, "medium": 0, "low": 1})
+        self.assertEqual(rn.parse_findings("no block"), ("no block", None))
+        self.assertIsNone(rn.parse_findings("```json\nnot json\n```")[1])
 
-    def test_nightly_report_over_the_limit_is_one_issue_per_review(self):
-        sections = ["a" * 60, "b" * 60]
-        groups = rn.nightly_issues("intro", sections, "footer", Path("/r.md"), limit=100)
-        self.assertEqual([idx for idx, _ in groups], [[0], [1]])
-        self.assertEqual(groups[0][1], "intro\n\n" + "a" * 60 + "\n\nfooter")
+    def test_section_renders_findings_with_ids(self):
+        p = {"type": "regression", "kind": "diff", "scope": {"title": "a..b"}, "reasons": ["r"]}
+        sec = rn.section(2, p, 'Summary.\n```json\n{"findings": [{"title": "T", "severity": "medium", "confidence": "CONFIRMED", "body": "B"}]}\n```')
+        self.assertIn("### 2.1. T\n\nSeverity: medium. Confidence: CONFIRMED.\n\nB", sec)
+        self.assertTrue(sec.endswith("0 critical, 0 high, 1 medium, 0 low."))
+        self.assertIn("No findings.", rn.section(1, p, 'S\n```json\n{"findings": []}\n```'))
+
+    def test_decide_applies_rules_triage_and_the_cap(self):
+        f = lambda i, sev, conf: {"id": i, "title": i, "severity": sev, "confidence": conf, "body": ""}
+        findings = [f("1.1", "high", "PLAUSIBLE"), f("1.2", "medium", "PLAUSIBLE"), f("1.3", "low", "CONFIRMED"),
+                    f("2.1", "medium", "CONFIRMED"), f("2.2", "low", "CONFIRMED")]
+        decisions = {"1.1": {"decision": "file", "reason": "a"}, "1.3": {"decision": "file", "reason": "b"},
+                     "2.1": {"decision": "duplicate", "issue": 7, "reason": "c"}}
+        rn.decide(findings, decisions, cap=1)
+        self.assertEqual([x["outcome"] for x in findings], ["file", "skip", "skip", "duplicate", "skip"])
+        self.assertIn("not confirmed", findings[1]["reason"])
+        self.assertIn("nightly limit of 1", findings[2]["reason"])
+        self.assertEqual(findings[4]["reason"], "triage gave no decision")
+        rn.decide(findings, None, cap=3)
+        self.assertEqual(findings[0]["reason"], "triage failed; not filed")
+
+    def test_issues_filed_for_findings_are_not_keyword_signals(self):
+        ledger = [{"type": "regression", "delivered": ["o/r#12", "#13"]}, {"type": "x", "delivered": "report"}]
+        self.assertEqual(rn.filed_numbers(ledger), {12, 13})
 
     def test_a_single_review_over_the_limit_is_cut_and_points_at_the_report(self):
         body = rn.fit_body("intro", ["x" * 500], "footer", Path("/state/r.md"), limit=200)
@@ -287,6 +315,8 @@ class Issues(unittest.TestCase):
             self.assertEqual(rn.file_issue(cfg, "Title", "Body", "req-1", []), ("#9", "#9 https://example/9"))
             self.assertEqual(json.loads((Path(d) / "request.json").read_text()),
                              {"repo": "o/r", "title": "Title", "body": "Body", "labels": ["review"], "request_id": "req-1"})
+            rn.file_issue(cfg, "Title", "Body", "req-2", [], ["review", "severity/low"])
+            self.assertEqual(json.loads((Path(d) / "request.json").read_text())["labels"], ["review", "severity/low"])
 
     def test_without_an_issue_repo_reports_stay_files(self):
         self.assertEqual(rn.fetch_issues({}), [])
@@ -343,6 +373,67 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(ledger[1]["counts"]["medium"], 1)
             self.assertEqual(ledger[2]["delivered"], "report")
             self.assertEqual(len(list((d / "state" / "reports").glob("*.md"))), 1)
+            self.assertFalse((d / "state" / "worktree" / ".review").exists())
+            git("worktree", "remove", "--force", str(d / "state" / "worktree"))
+
+    def test_a_nightly_run_files_one_issue_per_triaged_finding(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            repo = d / "repo"
+            git = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+            repo.mkdir()
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "t@example.com")
+            git("config", "user.name", "T")
+            (repo / "src").mkdir()
+            (repo / "src" / "a.py").write_text("print(1)\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "one")
+            findings = json.dumps({"findings": [
+                {"title": "Real bug", "severity": "medium", "confidence": "CONFIRMED", "body": "Scenario."},
+                {"title": "Known bug", "severity": "high", "confidence": "CONFIRMED", "body": "Seen."},
+                {"title": "Maybe", "severity": "low", "confidence": "PLAUSIBLE", "body": "?"}]})
+            decisions = json.dumps({"decisions": [{"id": "1.2", "decision": "file", "reason": "Confirmed."},
+                                                  {"id": "1.1", "decision": "duplicate", "issue": 3, "reason": "Same."}]})
+            (d / "findings.json").write_text(findings)
+            (d / "decisions.json").write_text(decisions)
+            reviewer = d / "reviewer"
+            reviewer.write_text("#!/usr/bin/env python3\nimport os, sys\nd = os.path.dirname(sys.argv[0])\n"
+                                "if 'triage' in sys.argv[1]:\n"
+                                "    open(os.path.join(d, 'triage-seen'), 'w').write(' '.join(os.listdir('.review')))\n"
+                                "    print('Notes\\n```json\\n' + open(os.path.join(d, 'decisions.json')).read() + '\\n```')\n"
+                                "else:\n"
+                                "    print('Review type: x\\n\\nSummary.\\n```json\\n' + open(os.path.join(d, 'findings.json')).read() + '\\n```')\n")
+            reviewer.chmod(0o755)
+            reviewer = str(reviewer)
+            creator = script(d, "create", "cat >> " + str(d) + '/requests.jsonl; echo >> ' + str(d) + '/requests.jsonl; echo \'{"ref": "o/r#21", "url": "https://example/21"}\'\n')
+            lister = script(d, "list", 'echo \'[{"number": 3, "title": "Known bug", "state": "open", "created_at": "2026-10-01T00:00:00Z", "milestone": null}]\'\n')
+            plan_dir = d / "plan"
+            plan_dir.mkdir()
+            (plan_dir / "review-plan.json").write_text(json.dumps({
+                "app": "Example", "repo": str(repo), "ref": "main", "app_paths": ["src/"], "state_dir": str(d / "state"),
+                "layers": {"src": {"title": "Source", "paths": ["src/"]}},
+                "types": {"maintainability": {"scope": "layer", "cadence_days": 7}},
+                "issues": {"repo": "o/r", "labels": ["qa"], "severity_labels": {"medium": ["severity/medium"]},
+                           "command": {"list": [lister, "{repo}"], "create": [creator]}},
+                "reviewers": [{"label": "fake", "command": [reviewer, "{prompt}"], "output": "text"}]}))
+            out = StringIO()
+            with redirect_stdout(out):
+                code = rn.main([str(plan_dir), "--nightly", "--count", "1"])
+            self.assertEqual(code, 0, out.getvalue())
+            requests = [json.loads(line) for line in (d / "requests.jsonl").read_text().split("\n") if line.strip()]
+            self.assertEqual([(r["title"], r["labels"]) for r in requests], [("Real bug", ["qa", "severity/medium"])])
+            self.assertIn("Scenario.", requests[0]["body"])
+            self.assertIn("finding 1.2", requests[0]["body"])
+            self.assertIn("Triage: Confirmed.", requests[0]["body"])
+            self.assertIn("candidates.json", (d / "triage-seen").read_text())
+            report = next((d / "state" / "reports").glob("*.md")).read_text()
+            self.assertIn("1.2 (medium) Real bug: filed as o/r#21. Confirmed.", report)
+            self.assertIn("1.1 (high) Known bug: duplicate of #3. Same.", report)
+            self.assertIn("1.3 (low) Maybe: skipped. not confirmed", report)
+            ledger = rn.read_ledger(d / "state" / "ledger.jsonl")
+            self.assertEqual(ledger[0]["delivered"], ["o/r#21"])
+            self.assertEqual(ledger[0]["counts"], {"critical": 0, "high": 1, "medium": 1, "low": 1})
             self.assertFalse((d / "state" / "worktree" / ".review").exists())
             git("worktree", "remove", "--force", str(d / "state" / "worktree"))
 

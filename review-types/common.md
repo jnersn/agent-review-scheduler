@@ -27,16 +27,29 @@ These rules apply to every type in this directory. Read them together with the o
 - **low**: an edge case or a minor effect. For non-bug types: cleanup with a clear but small payoff.
 
 ## Each finding
-- A bold one-line title.
+A finding may become an issue of its own, so write it to stand alone: someone who reads only that finding must understand it.
+- A one-line title.
 - Severity, and confidence: CONFIRMED (you traced it) or PLAUSIBLE (say what would confirm it).
 - `file:line` for every location involved.
 - Evidence: for a bug, a concrete scenario (starting state or inputs → steps → wrong result); for other types, what you found and why it matters.
 - One line on the direction of the fix, plus size (S/M/L) and risk (low/med/high) for non-bug types.
 
 ## Output
-Write plain Markdown suitable for an issue:
-- a numbered list of findings, sorted by severity;
-- then a one-line count by severity, for example "0 critical, 1 high, 2 medium, 1 low";
-- then at most 200 words of summary.
+Write Markdown:
+- the first line the request asks for;
+- at most 200 words of summary: what you checked, and what you could not check;
+- last, one fenced `json` block with every finding, sorted by severity, and nothing after it:
+
+```json
+{"findings": [
+  {"title": "Removing a damaged model leaves an old error on screen", "severity": "low", "confidence": "CONFIRMED",
+   "body": "**Locations:** ...\n\n**Scenario:** ...\n\n**Fix:** ..."}
+]}
+```
+
+- `title`: the one-line title, plain text.
+- `severity`: critical, high, medium or low. `confidence`: CONFIRMED or PLAUSIBLE (the body says what would confirm it).
+- `body`: the rest of the finding as Markdown: the locations, the evidence or scenario, and the fix line.
+- Write the findings only in this block, and make it valid JSON (escape quotes and newlines). With no findings, write `{"findings": []}`.
 
 Don't paste large code blocks.

@@ -203,6 +203,12 @@ class Reports(unittest.TestCase):
         self.assertEqual(rn.parse_findings("no block"), ("no block", None))
         self.assertIsNone(rn.parse_findings("```json\nnot json\n```")[1])
 
+    def test_trailing_commas_outside_strings_are_tolerated(self):
+        reply = ('```json\n{"findings": [\n  {"title": "A", "severity": "low", "body": "x, ] \\" ,}",\n  },\n]}\n```')
+        _, findings = rn.parse_findings(reply)
+        self.assertEqual([(f["title"], f["body"]) for f in findings], [("A", 'x, ] " ,}')])
+        self.assertEqual(rn.drop_trailing_commas('{"a": [1, 2,], "b": ",]"}'), '{"a": [1, 2], "b": ",]"}')
+
     def test_section_renders_findings_with_ids(self):
         p = {"type": "regression", "kind": "diff", "scope": {"title": "a..b"}, "reasons": ["r"]}
         sec = rn.section(2, p, 'Summary.\n```json\n{"findings": [{"title": "T", "severity": "medium", "confidence": "CONFIRMED", "body": "B"}]}\n```')

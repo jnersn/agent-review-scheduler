@@ -412,14 +412,40 @@ def parse_counts(report: str) -> Dict[str, int]:
     return {sev: counts.get(sev, 0) for sev in SEVERITIES}
 
 
+def drop_trailing_commas(raw: str) -> str:
+    """`raw` without the commas that directly precede a `}` or `]` outside strings (a common slip in a model's JSON)."""
+    out: List[str] = []
+    in_str = escaped = False
+    for ch in raw:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "}]":
+            while out and out[-1].isspace():
+                out.pop()
+            if out and out[-1] == ",":
+                out.pop()
+        out.append(ch)
+    return "".join(out)
+
+
 def last_json_block(text: str) -> Tuple[Optional[Any], Optional[re.Match]]:
     blocks = list(JSON_BLOCK_RE.finditer(text))
     if not blocks:
         return None, None
-    try:
-        return json.loads(blocks[-1].group(1)), blocks[-1]
-    except ValueError:
-        return None, blocks[-1]
+    raw = blocks[-1].group(1)
+    for candidate in (raw, drop_trailing_commas(raw)):
+        try:
+            return json.loads(candidate), blocks[-1]
+        except ValueError:
+            pass
+    return None, blocks[-1]
 
 
 def parse_findings(report: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
